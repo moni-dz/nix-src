@@ -9,8 +9,11 @@
 #include "nix/store/active-builds.hh"
 #include "nix/util/util.hh"
 
+#include <algorithm>
+#include <array>
 #include <deque>
 #include <map>
+#include <ranges>
 #include <thread>
 #include <sstream>
 #include <iostream>
@@ -120,8 +123,29 @@ protected:
 
         uint64_t corruptedPaths = 0, untrustedPaths = 0;
 
-        bool active = true;
         size_t suspensions = 0;
+
+        struct StatusReportState
+        {
+            static constexpr auto minInterval = std::chrono::seconds(1);
+
+            // stable across runs, so each run replaces the record left behind by the previous one
+            static constexpr std::string_view id = "nix";
+
+            std::string lastReport;
+            std::optional<uint64_t> lastProgress;
+            std::chrono::steady_clock::time_point lastTime;
+            std::optional<ProgramState> lastState;
+            bool interrupted = false;
+            bool pending = false;
+
+            std::chrono::steady_clock::time_point retryAt() const
+            {
+                return lastTime + minInterval;
+            }
+        } statusReportState;
+
+        bool active = true;
         bool haveUpdate = true;
 
         bool isPaused() const
@@ -190,6 +214,38 @@ protected:
 
     std::unique_ptr<InterruptCallback> interruptCallback, stopCallback, contCallback, winchCallback;
 
+    void reportStatus(
+        State::StatusReportState & sr,
+        ProgramState st,
+        std::string_view msg = "",
+        std::optional<uint64_t> progress = {},
+        std::optional<ProgramStatusKind> kind = {})
+    {
+        if (!isTTY)
+            return;
+
+        auto now = std::chrono::steady_clock::now();
+
+        // send state and progress changes immediately, but defer message-only changes without building the report
+        if (st == ProgramState::Working && sr.lastState == st && sr.lastProgress == progress && now < sr.retryAt()) {
+            sr.pending = true;
+            updateCV.notify_one();
+            return;
+        }
+
+        auto report = makeProgramStatusReport(st, sr.id, msg, progress, kind);
+        sr.pending = false;
+
+        if (report == sr.lastReport)
+            return;
+
+        sr.lastReport = report;
+        sr.lastState = st;
+        sr.lastProgress = progress;
+        sr.lastTime = now;
+        writeToStderr(report);
+    }
+
     void hideCursorIfNeeded() const
     {
         if (isTTY)
@@ -243,6 +299,7 @@ public:
         hideCursorIfNeeded();
 
         interruptCallback = createInterruptCallback([&]() {
+            state_.lock()->statusReportState.interrupted = true;
             /* Don't print the current activities, since we're about
                to abort them anyway. */
             pause(false);
@@ -283,9 +340,20 @@ public:
         updateThread = std::thread([&]() {
             auto state(state_.lock());
             auto nextWakeup = std::chrono::milliseconds::max();
+
             while (state->active) {
-                if (!state->haveUpdate)
-                    state.wait_for(updateCV, nextWakeup);
+                if (!state->haveUpdate) {
+                    auto delay = nextWakeup;
+
+                    if (state->statusReportState.pending && !state->isPaused()) {
+                        auto retryDelay = std::chrono::ceil<std::chrono::milliseconds>(
+                            state->statusReportState.retryAt() - std::chrono::steady_clock::now());
+                        delay = std::min(delay, std::max(retryDelay, std::chrono::milliseconds::zero()));
+                    }
+
+                    state.wait_for(updateCV, delay);
+                }
+
                 nextWakeup = draw(*state);
                 state.wait_for(quitCV, std::chrono::milliseconds(50));
             }
@@ -305,6 +373,13 @@ public:
             if (state->active) {
                 suspendInput(*state);
                 state->active = false;
+
+                if (state->statusReportState.lastState) {
+                    state->statusReportState.lastReport = makeProgramStatusClearReport(state->statusReportState.id);
+                    state->statusReportState.pending = false;
+                    writeToStderr(state->statusReportState.lastReport);
+                }
+
                 clearProgressDisplay();
                 unhideCursorIfNeeded();
                 updateCV.notify_one();
@@ -313,6 +388,28 @@ public:
         }
         if (updateThread.joinable())
             updateThread.join();
+    }
+
+    void exited(int status) override
+    {
+        auto state(state_.lock());
+
+        if (state->statusReportState.lastState) {
+            auto finalState = ProgramState::Error;
+            auto msg = fmt("exited with status %d", status);
+
+            if (status == 0) {
+                finalState = ProgramState::Done;
+                msg = "finished successfully";
+            }
+
+            if (state->statusReportState.interrupted) {
+                finalState = ProgramState::Idle;
+                msg = "interrupted";
+            }
+
+            reportStatus(state->statusReportState, finalState, msg);
+        }
     }
 
     void pause() override
@@ -747,6 +844,8 @@ public:
 
         auto lines = renderFrame(state, std::chrono::steady_clock::now(), nextWakeup);
 
+        reportWorking(state);
+
         /* Don't draw more lines than fit in the terminal, since then
            we can't move the cursor back to the start of the frame. On
            the alternate screen, we draw from the top of the screen, so
@@ -798,6 +897,87 @@ public:
         return stats;
     }
 
+    static bool hasProgressCounters(ActivityType type)
+    {
+        static constexpr std::array types{
+            actBuilds,
+            actBuild,
+            actCopyPaths,
+            actCopyPath,
+            actSubstitute,
+            actFileTransfer,
+            actOptimiseStore,
+            actVerifyPaths,
+        };
+        return std::ranges::find(types, type) != types.end();
+    }
+
+    static bool haveRunningCounters(State & state)
+    {
+        return std::ranges::any_of(state.activitiesByType, [](auto & entry) {
+            return !entry.second.its.empty() && hasProgressCounters(entry.first);
+        });
+    }
+
+    static std::optional<uint64_t> getProgress(State & state)
+    {
+        double done = 0, expected = 0;
+
+        for (auto & [type, _] : state.activitiesByType) {
+            auto stats = getActivityStats(state, type);
+
+            if (stats.expected == 0)
+                continue;
+
+            // normalize byte counts to [0, 1], so they count as one activity
+            if (type == actCopyPath || type == actFileTransfer) {
+                done += static_cast<double>(std::min(stats.done, stats.expected)) / stats.expected;
+                expected += 1;
+            } else {
+                done += stats.done;
+                expected += stats.expected;
+            }
+        }
+
+        if (expected == 0)
+            return {};
+
+        return std::min<uint64_t>(100, done * 100 / expected);
+    }
+
+    void reportWorking(State & state)
+    {
+        std::string statusMessage;
+
+        auto latest = state.activities | std::views::reverse;
+        if (auto i = std::ranges::find_if(latest, [](auto & a) { return a.visible && !a.s.empty(); });
+            i != latest.end()) {
+            statusMessage = i->s;
+
+            if (!i->phase.empty()) {
+                statusMessage += " (";
+                statusMessage += i->phase;
+                statusMessage += ")";
+            }
+        }
+
+        // without running counters there's no progress to report
+        auto progress = haveRunningCounters(state) ? getProgress(state) : std::nullopt;
+
+        // still working while e.g. an unnamed parent runs between its named children
+        auto working = std::ranges::any_of(state.activities, [](auto & a) { return a.visible; });
+
+        auto lastState = state.statusReportState.lastState;
+
+        if (working || progress)
+            reportStatus(state.statusReportState, ProgramState::Working, statusMessage, progress);
+        else if (lastState == ProgramState::Working || lastState == ProgramState::Blocked)
+            // nothing left to show, e.g. after a prompt was answered
+            reportStatus(state.statusReportState, ProgramState::Idle);
+        else
+            state.statusReportState.pending = false;
+    }
+
     void writeToStdout(std::string_view s) override
     {
         auto state(state_.lock());
@@ -830,13 +1010,16 @@ public:
         suspendInput(*state);
         clearProgressDisplay(fmt("%s ", msg));
         unhideCursorIfNeeded();
+        reportStatus(state->statusReportState, ProgramState::Blocked, msg, {}, ProgramStatusKind::Permission);
         auto s = trim(readLine(getStandardInput(), true));
         hideCursorIfNeeded();
         if (!state->isPaused())
             resumeInput(*state);
+        draw(*state);
+        if (state->statusReportState.lastState == ProgramState::Blocked)
+            reportStatus(state->statusReportState, ProgramState::Working);
         if (s.size() != 1)
             return {};
-        draw(*state);
         return s[0];
     }
 
@@ -1452,10 +1635,10 @@ private:
                     return;
             }
 
-            std::array<struct pollfd, 2> fds{{
-                {.fd = STDIN_FILENO, .events = POLLIN, .revents = 0},
-                {.fd = wakeupPipe.readSide.get(), .events = POLLIN, .revents = 0},
-            }};
+            std::array<struct pollfd, 2> fds{
+                { {.fd = STDIN_FILENO, .events = POLLIN, .revents = 0},
+                  {.fd = wakeupPipe.readSide.get(), .events = POLLIN, .revents = 0},
+                }};
 
             if (poll(fds.data(), fds.size(), -1) == -1) {
                 if (errno == EINTR)
@@ -1496,7 +1679,7 @@ private:
 
     void handleKey(char c)
     {
-        c = std::tolower((unsigned char) c);
+        c = std::tolower(static_cast<unsigned char>(c));
 
         if (c == 'q') {
             /* Note: this calls the interrupt callback, which calls
@@ -1520,14 +1703,14 @@ private:
         case '+':
         case '=':
             if (verbosity < lvlVomit) {
-                verbosity = (Verbosity) (verbosity + 1);
+                verbosity = static_cast<Verbosity>(verbosity + 1);
                 log(*state, lvlError, ANSI_BOLD "Increasing verbosity.");
             }
             break;
 
         case '-':
             if (verbosity > lvlError) {
-                verbosity = (Verbosity) (verbosity - 1);
+                verbosity = static_cast<Verbosity>(verbosity - 1);
                 log(*state, lvlError, ANSI_BOLD "Decreasing verbosity.");
             }
             break;
@@ -1794,8 +1977,10 @@ private:
         /* Render a progress bar showing the fraction of failed (red),
            done (green) and running (yellow) items. */
         auto renderBar = [&](uint64_t done, uint64_t failed, uint64_t running, uint64_t expected) {
-            expected = std::max(expected, (uint64_t) 1);
-            auto chars = [&](uint64_t n) { return (size_t) (barWidth * std::min((double) n / expected, 1.0)); };
+            expected = std::max(expected, uint64_t(1));
+            auto chars = [&](uint64_t n) {
+                return static_cast<size_t>(barWidth * std::min(static_cast<double>(n) / expected, 1.0));
+            };
             auto chars1 = chars(failed);
             auto chars2 = chars(failed + done);
             auto chars3 = chars(failed + done + running);
@@ -1804,7 +1989,7 @@ private:
         };
 
         auto renderSizes = [&](uint64_t done, uint64_t expected) {
-            if (auto unit = getCommonSizeUnit({(int64_t) done, (int64_t) expected}))
+            if (auto unit = getCommonSizeUnit({static_cast<int64_t>(done), static_cast<int64_t>(expected)}))
                 return fmt(
                     "%s/%s %siB",
                     renderSizeWithoutUnit(done, *unit),
