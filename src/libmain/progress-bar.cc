@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <deque>
 #include <map>
 #include <ranges>
@@ -129,6 +130,15 @@ protected:
         {
             static constexpr auto minInterval = std::chrono::seconds(1);
 
+            /* a logger can be replaced while running,
+               nix should not forget to report interrupts or report done twice. */
+            struct Process
+            {
+                static inline std::atomic<bool> reported{false};
+                static inline std::atomic<bool> exitReported{false};
+                static inline std::atomic<bool> interrupted{false};
+            };
+
             // stable across runs, so each run replaces the record left behind by the previous one
             static constexpr std::string_view id = "nix";
 
@@ -136,7 +146,6 @@ protected:
             std::optional<uint64_t> lastProgress;
             std::chrono::steady_clock::time_point lastTime;
             std::optional<ProgramState> lastState;
-            bool interrupted = false;
             bool pending = false;
 
             std::chrono::steady_clock::time_point retryAt() const
@@ -214,6 +223,8 @@ protected:
 
     std::unique_ptr<InterruptCallback> interruptCallback, stopCallback, contCallback, winchCallback;
 
+    using Process = State::StatusReportState::Process;
+
     void reportStatus(
         State::StatusReportState & sr,
         ProgramState st,
@@ -243,6 +254,7 @@ protected:
         sr.lastState = st;
         sr.lastProgress = progress;
         sr.lastTime = now;
+        Process::reported = true;
         writeToStderr(report);
     }
 
@@ -299,7 +311,7 @@ public:
         hideCursorIfNeeded();
 
         interruptCallback = createInterruptCallback([&]() {
-            state_.lock()->statusReportState.interrupted = true;
+            Process::interrupted = true;
             /* Don't print the current activities, since we're about
                to abort them anyway. */
             pause(false);
@@ -394,7 +406,8 @@ public:
     {
         auto state(state_.lock());
 
-        if (state->statusReportState.lastState) {
+        bool failed = status != 0 && !Process::interrupted;
+        if ((Process::reported || failed) && !Process::exitReported.exchange(true)) {
             auto finalState = ProgramState::Error;
             auto msg = fmt("exited with status %d", status);
 
@@ -403,7 +416,7 @@ public:
                 msg = "finished successfully";
             }
 
-            if (state->statusReportState.interrupted) {
+            if (Process::interrupted) {
                 finalState = ProgramState::Idle;
                 msg = "interrupted";
             }
