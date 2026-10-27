@@ -980,14 +980,10 @@ public:
         // still working while e.g. an unnamed parent runs between its named children
         auto working = std::ranges::any_of(state.activities, [](auto & a) { return a.visible; });
 
-        auto lastState = state.statusReportState.lastState;
-
         if (working || progress)
             reportStatus(state.statusReportState, ProgramState::Working, statusMessage, progress);
-        else if (lastState == ProgramState::Working || lastState == ProgramState::Blocked)
-            // nothing left to show, e.g. after a prompt was answered
-            reportStatus(state.statusReportState, ProgramState::Idle);
         else
+            // gaps between activities aren't idle, the final state is reported on exit
             state.statusReportState.pending = false;
     }
 
