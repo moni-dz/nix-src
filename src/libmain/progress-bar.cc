@@ -111,6 +111,11 @@ protected:
         uint64_t done = 0;
         uint64_t expected = 0;
         uint64_t failed = 0;
+
+        bool hasUnknownSize() const
+        {
+            return std::ranges::any_of(its, [](auto & j) { return j.second->expected == 0; });
+        }
     };
 
     struct State
@@ -944,6 +949,9 @@ public:
 
             // normalize byte counts to [0, 1], so they count as one activity
             if (type == actCopyPath || type == actFileTransfer) {
+                if (state.activitiesByType[type].hasUnknownSize())
+                    return {};
+
                 done += static_cast<double>(std::min(stats.done, stats.expected)) / stats.expected;
                 expected += 1;
             } else {
@@ -1152,6 +1160,8 @@ private:
 
         auto renderSizeActivity = [&] [[nodiscard]] (ActivityType type, const std::string & itemFmt = "%s") {
             auto [done, expected, running, failed] = getActivityStats(state, type);
+            if (state.activitiesByType[type].hasUnknownSize())
+                expected = 0;
 
             std::optional<SizeUnit> commonUnit;
             std::string s;
